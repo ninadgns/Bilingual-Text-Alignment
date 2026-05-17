@@ -28,6 +28,10 @@ import pdfplumber
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 
+# LLM review is optional — imported lazily to avoid hard dependency when not used.
+# Categories that lack a reliable heuristic signal and are sent to the LLM.
+LLM_REVIEW_CATEGORIES = {"anchor-x", "rule-x", "none"}
+
 # Per-PDF column split (x-coordinate). Words with x0 < split = left col (term),
 # >= split = right col (definition). Holds across HKEX Main Board rules PDFs.
 EN_COL_SPLIT = 180
@@ -247,13 +251,15 @@ def sanity_label(en: Optional[Entry], zh: Optional[Entry]) -> tuple[str, str]:
     return "-", "none"
 
 
-def write_excel(rows, out_path):
+def write_excel(rows, out_path, *, include_llm: bool = False):
     wb = Workbook()
     ws = wb.active
     ws.title = "Aligned"
     header_font = Font(bold=True, color="FFFFFF")
     header_fill = PatternFill("solid", fgColor="305496")
     headers = ["Line", "Page (EN)", "Page (ZH)", "English", "Chinese", "Match?"]
+    if include_llm:
+        headers += ["LLM Verdict", "LLM Explanation"]
     for col, h in enumerate(headers, 1):
         c = ws.cell(row=1, column=col, value=h)
         c.font = header_font
@@ -269,11 +275,21 @@ def write_excel(rows, out_path):
     ws.column_dimensions["D"].width = 60
     ws.column_dimensions["E"].width = 60
     ws.column_dimensions["F"].width = 22
+    if include_llm:
+        ws.column_dimensions["G"].width = 14
+        ws.column_dimensions["H"].width = 60
     ws.freeze_panes = "A2"
     wb.save(out_path)
 
 
-def align(en_pdf: str, zh_pdf: str, out_xlsx: str) -> None:
+def align(
+    en_pdf: str,
+    zh_pdf: str,
+    out_xlsx: str,
+    *,
+    use_llm: bool = False,
+    llm_model: str = "gemini-2.0-flash",
+) -> None:
     print(f"EN: {en_pdf}")
     print(f"ZH: {zh_pdf}")
 
@@ -281,36 +297,95 @@ def align(en_pdf: str, zh_pdf: str, out_xlsx: str) -> None:
     zh_entries = extract_entries(zh_pdf, ZH_COL_SPLIT, lang="zh")
     print(f"EN entries: {len(en_entries)}    ZH entries: {len(zh_entries)}")
 
+    llm_client = None
+    if use_llm:
+        from llm_review import get_api_key, review_pair
+        from google import genai
+
+        api_key = get_api_key()
+        if not api_key:
+            raise SystemExit(
+                "LLM review requested but no API key found. "
+                "Set GEMINI_API_KEY in .env (see .env.example)."
+            )
+        llm_client = genai.Client(api_key=api_key)
+        print(f"LLM review enabled (model={llm_model}, triggers on: {', '.join(sorted(LLM_REVIEW_CATEGORIES))})")
+
     rows = []
     counts = {"anchor-ok": 0, "anchor-x": 0, "rule-ok": 0, "rule-x": 0, "none": 0}
+    llm_counts = {"match": 0, "partial": 0, "mismatch": 0, "error": 0}
     n = max(len(en_entries), len(zh_entries))
     for i in range(n):
         en = en_entries[i] if i < len(en_entries) else None
         zh = zh_entries[i] if i < len(zh_entries) else None
         tag, category = sanity_label(en, zh)
         counts[category] += 1
-        rows.append([
+
+        llm_verdict = ""
+        llm_explanation = ""
+        if use_llm and category in LLM_REVIEW_CATEGORIES and en and zh:
+            from llm_review import review_pair
+            try:
+                result = review_pair(en.text, zh.text, client=llm_client, model=llm_model)
+                llm_verdict = result.verdict
+                llm_explanation = result.explanation
+                llm_counts[llm_verdict] = llm_counts.get(llm_verdict, 0) + 1
+                print(f"  row {i+1}: {category} → LLM={llm_verdict}")
+            except Exception as exc:
+                llm_verdict = "error"
+                llm_explanation = str(exc)[:500]
+                llm_counts["error"] += 1
+
+        row = [
             i + 1,
             en.page if en else "",
             zh.page if zh else "",
             en.text if en else "",
             zh.text if zh else "",
             tag,
-        ])
+        ]
+        if use_llm:
+            row += [llm_verdict, llm_explanation]
+        rows.append(row)
 
     print(f"sanity: anchor OK={counts['anchor-ok']}  anchor X={counts['anchor-x']}  "
           f"rule OK={counts['rule-ok']}  rule X={counts['rule-x']}  no-signal={counts['none']}")
-    write_excel(rows, out_xlsx)
+    if use_llm:
+        reviewed = sum(v for k, v in llm_counts.items() if k != "error")
+        print(f"LLM: reviewed={reviewed}  match={llm_counts['match']}  "
+              f"partial={llm_counts['partial']}  mismatch={llm_counts['mismatch']}  "
+              f"error={llm_counts['error']}")
+    write_excel(rows, out_xlsx, include_llm=use_llm)
     print(f"Wrote {out_xlsx} ({len(rows)} rows)")
 
 
 def main():
+    from llm_review import llm_available
+
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("en_folder", help="Folder containing English PDFs")
     parser.add_argument("zh_folder", help="Folder containing Traditional-Chinese PDFs")
     parser.add_argument("out_folder", nargs="?", default="output",
                         help="Output folder for .xlsx files (default: ./output)")
+    parser.add_argument(
+        "--llm",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Run Gemini review inline on low-confidence rows (default: on if API key in .env)",
+    )
+    parser.add_argument(
+        "--llm-model",
+        default="gemini-2.0-flash",
+        help="Gemini model for translation review (default: gemini-2.0-flash)",
+    )
     args = parser.parse_args()
+
+    use_llm = args.llm if args.llm is not None else llm_available()
+    if use_llm and not llm_available():
+        raise SystemExit(
+            "LLM review requested but no API key found. "
+            "Set GEMINI_API_KEY in .env (see .env.example)."
+        )
 
     os.makedirs(args.out_folder, exist_ok=True)
 
@@ -330,7 +405,7 @@ def main():
         stem = os.path.splitext(filename)[0].replace(" ", "_").lower()
         out_xlsx = os.path.join(args.out_folder, f"{stem}_aligned.xlsx")
         print(f"\n=== {filename} ===")
-        align(en_path, zh_path, out_xlsx)
+        align(en_path, zh_path, out_xlsx, use_llm=use_llm, llm_model=args.llm_model)
 
 
 if __name__ == "__main__":
