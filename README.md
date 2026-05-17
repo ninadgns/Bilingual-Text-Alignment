@@ -5,13 +5,22 @@ Aligns English and Traditional Chinese HKEX rulebook PDF chapters entry-by-entry
 ## Requirements
 
 ```
-pip install pdfplumber openpyxl
+pip install -r requirements.txt
+```
+
+## Setup
+
+**Optional — LLM review:** Copy `.env.example` to `.env` and add your Gemini API key. If present, low-confidence rows are automatically reviewed by the LLM. Omit the file to run without LLM review.
+
+```
+cp .env.example .env
+# edit .env and set GEMINI_API_KEY=...
 ```
 
 ## Usage
 
 ```
-python3 compare.py <en_folder> <zh_folder> [out_folder]
+python3 compare.py <en_folder> <zh_folder> [out_folder] [--llm | --no-llm] [--llm-model MODEL]
 ```
 
 | Argument | Description |
@@ -19,6 +28,8 @@ python3 compare.py <en_folder> <zh_folder> [out_folder]
 | `en_folder` | Folder containing English PDF chapters |
 | `zh_folder` | Folder containing Traditional Chinese PDF chapters |
 | `out_folder` | Output folder for `.xlsx` files (default: `./output`) |
+| `--llm` / `--no-llm` | Force LLM review on or off (default: on if `GEMINI_API_KEY` is set) |
+| `--llm-model` | Gemini model to use (default: `gemini-2.0-flash`) |
 
 PDFs are matched by filename across the two folders. One `.xlsx` file is written per matched pair.
 
@@ -41,7 +52,9 @@ Each Excel file has one row per aligned entry:
 | Page (ZH) | Page the entry was found on in the Chinese PDF |
 | English | Full reconstructed text of the English entry |
 | Chinese | Full reconstructed text of the Chinese entry |
-| Match? | Sanity-check result (see below) |
+| Match? | Heuristic sanity-check result (see below) |
+| LLM Verdict | `match` / `partial` / `mismatch` — only present when LLM review is enabled |
+| LLM Explanation | Brief reason from the LLM (1-2 sentences) |
 
 ### Match column values
 
@@ -52,6 +65,8 @@ Each Excel file has one row per aligned entry:
 | `X anchor en=... zh=...` | Anchor check failed — terms don't match |
 | `X rule en=... zh=...` | Rule ID mismatch |
 | `-` | No checkable signal in either entry |
+
+Rows marked `X ...` or `-` are automatically sent to the LLM for a second opinion when LLM review is enabled.
 
 ## How it works
 
